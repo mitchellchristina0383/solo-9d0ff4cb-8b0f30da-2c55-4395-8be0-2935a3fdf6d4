@@ -13,6 +13,11 @@
   S9  接收端不可用 → 待核且不虚报成功（--lifecycle）
   S10 发送端重启（接收端停机中）→ 待核持久 → 恢复后凭回执补核（--lifecycle）
   S11 发送端重启（接收端正常）→ 启动自动核对凭回执结案（--lifecycle）
+  S12 按环境暂停：新发布号 423 拒收且不落库，已入账回执仍可查、同内容重试/异内容冲突不受影响
+  S13 暂停与在途入账交错：先入账者回执可查，被拒收者不会随后自行入账
+  S14 暂停写入失败 → 原状态不变
+  S15 接收端重启后暂停开关仍保留（--lifecycle）
+  S16 发送端显示暂停拒收；暂停期间核对不误判为已送达/可安全重发；恢复后核对再重试成功（--lifecycle）
 
 用法：
   python3 tests/selftest.py [--lifecycle]
@@ -28,6 +33,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 SENDER = os.environ.get("SENDER_URL", "http://127.0.0.1:8000").rstrip("/")
@@ -35,6 +41,10 @@ RECEIVER = os.environ.get("RECEIVER_URL", "http://127.0.0.1:8001").rstrip("/")
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RUN = str(int(time.time()))
 ENV = "itest"
+PAUSE_ENV = "itest-paused"
+INTERLEAVE_ENV = "itest-inter"
+PERSIST_ENV = "itest-persist"
+RECOVER_ENV = "itest-recover"
 
 PASSED, FAILED = [], []
 
@@ -80,14 +90,14 @@ def sender_reconcile(nid):
     return req("POST", f"{SENDER}/api/notifications/{nid}/reconcile")
 
 
-def sender_rows(rel):
+def sender_rows(rel, env=ENV):
     _, d = req("GET", SENDER + "/api/notifications")
-    return [x for x in d.get("items", []) if x["env"] == ENV and x["release_no"] == rel]
+    return [x for x in d.get("items", []) if x["env"] == env and x["release_no"] == rel]
 
 
-def receiver_rows(rel):
+def receiver_rows(rel, env=ENV):
     _, d = req("GET", RECEIVER + "/api/receipts")
-    return [x for x in d.get("items", []) if x["env"] == ENV and x["release_no"] == rel]
+    return [x for x in d.get("items", []) if x["env"] == env and x["release_no"] == rel]
 
 
 def hook(env_var, default_cmd):
@@ -97,6 +107,27 @@ def hook(env_var, default_cmd):
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if r.returncode != 0:
         print(f"  !! 钩子返回码 {r.returncode}", flush=True)
+
+
+def receiver_post(env, rel, result):
+    return req("POST", RECEIVER + "/api/receipts",
+               {"env": env, "release_no": rel, "result": result})
+
+
+def receiver_get(env, rel):
+    return req("GET", RECEIVER + "/api/receipts?"
+               + urllib.parse.urlencode({"env": env, "release_no": rel}))
+
+
+def receiver_pause(env):
+    return req("GET", RECEIVER + "/api/pauses/" + urllib.parse.quote(env))
+
+
+def set_pause(env, paused, simulate=None):
+    body = {"env": env, "paused": paused}
+    if simulate:
+        body["simulate"] = simulate
+    return req("POST", RECEIVER + "/api/pauses", body)
 
 
 def wait_up(base, tries=60):
@@ -230,6 +261,174 @@ def s8_concurrent_diff():
               len(rrows) == 1 and rrows[0]["result"] == rows[0]["result"], f"{rrows} vs {rows}")
 
 
+def s12_pause_reject_and_query():
+    env = PAUSE_ENV
+    k1, k2 = key("p1"), key("p2")
+    code, r = receiver_post(env, k1, "success")
+    check("S12 暂停前正常入账", code == 201, f"code={code} {r}")
+
+    code, st = set_pause(env, True)
+    check("S12 暂停写入成功且状态为已暂停", code == 200 and st.get("state", {}).get("paused") is True,
+          f"code={code} {st}")
+    code, state = receiver_pause(env)
+    check("S12 暂停状态可查", code == 200 and state.get("paused") is True, f"{state}")
+
+    code, r2 = receiver_post(env, k2, "success")
+    check("S12 暂停期间新发布号被明确拒收（423）",
+          code == 423 and r2.get("code") == "ENV_PAUSED", f"code={code} {r2}")
+    check("S12 被拒收的新发布号未落库", len(receiver_rows(k2, env)) == 0, f"{receiver_rows(k2, env)}")
+    code, _ = receiver_get(env, k2)
+    check("S12 被拒收后查询为无记录", code == 404, f"code={code}")
+
+    code, r3 = receiver_get(env, k1)
+    check("S12 暂停期间已入账回执仍可查", code == 200 and r3.get("release_no") == k1, f"code={code} {r3}")
+    code, r4 = receiver_post(env, k1, "success")
+    check("S12 暂停期间同键同内容重试仍返回原回执",
+          code == 200 and r4.get("deduplicated") is True and r4.get("id") == r.get("id"),
+          f"code={code} {r4}")
+    code, r5 = receiver_post(env, k1, "failed")
+    check("S12 暂停期间同键异内容仍为 409", code == 409, f"code={code} {r5}")
+    check("S12 全程仅入账一条", len(receiver_rows(k1, env)) == 1 and len(receiver_rows(k2, env)) == 0)
+
+    code, st2 = set_pause(env, False)
+    check("S12 恢复成功", code == 200 and st2.get("state", {}).get("paused") is False, f"{st2}")
+    code, r6 = receiver_post(env, k2, "success")
+    check("S12 恢复后新发布号可入账", code == 201, f"code={code} {r6}")
+
+
+def s13_pause_interleaved():
+    """暂停与在途入账交错：只用接收端直连并发，断言「先入账必有回执，被拒收绝不入账」。
+
+    重复多轮，每轮在并发写入期间插入暂停；要求至少一轮真实出现「部分已入账 + 部分被拒收」，
+    避免因调度恰好全部先完成而空跑。
+    """
+    env = INTERLEAVE_ENV
+    mixed_rounds = 0
+    accepted_all, rejected_all = [], []
+    all_outcomes = []
+    for rnd in range(6):
+        set_pause(env, False)
+        outcomes = []  # (code, release_no, body)
+        lock = threading.Lock()
+
+        def worker(rel):
+            code, body = receiver_post(env, rel, "success")
+            with lock:
+                outcomes.append((code, rel, body))
+
+        threads = [threading.Thread(target=worker, args=(key(f"i{rnd}-{n}"),)) for n in range(16)]
+        for t in threads:
+            t.start()
+        time.sleep(0.005 + rnd * 0.004)  # 让暂停落在不同的写入时点
+        _, st = set_pause(env, True)
+        for t in threads:
+            t.join()
+
+        accepted = [o for o in outcomes if o[0] == 201]
+        rejected = [o for o in outcomes if o[0] == 423]
+        all_outcomes.extend(outcomes)
+        accepted_all.extend(accepted)
+        rejected_all.extend(rejected)
+        if accepted and rejected:
+            mixed_rounds += 1
+        check(f"S13 第{rnd + 1}轮每个请求要么入账要么明确拒收",
+              len(accepted) + len(rejected) == 16 and not [o for o in outcomes if o[0] not in (201, 423)],
+              f"{outcomes}")
+
+    check("S13 交错中暂停成功", bool(rejected_all), f"accepted={len(accepted_all)} rejected={len(rejected_all)}")
+    check("S13 实际出现暂停与在途入账交错（有入账也有拒收）", mixed_rounds >= 1,
+          f"mixed_rounds={mixed_rounds}")
+    ok = True
+    for code, rel, body in accepted_all:
+        c, rec = receiver_get(env, rel)
+        if not (c == 200 and rec.get("id") == body.get("id")):
+            ok = False
+    check("S13 先入账者均有可查回执", ok, f"{accepted_all}")
+    leaked = [rel for code, rel, _ in rejected_all if len(receiver_rows(rel, env)) != 0]
+    check("S13 被拒收的请求均未自行入账", leaked == [], f"leaked={leaked}")
+
+    # 暂停生效后新号全部拒收；被拒收的号在恢复后也不会「自行出现」，只能显式重试
+    code, r = receiver_post(env, key("i-after"), "success")
+    check("S13 暂停稳定后新号仍被拒收", code == 423, f"code={code} {r}")
+    set_pause(env, False)
+    time.sleep(0.3)
+    check("S13 被拒收的号恢复后仍无记录", len(receiver_rows(key("i-after"), env)) == 0)
+    code, r2 = receiver_post(env, key("i-after"), "success")
+    check("S13 恢复后显式重试才入账", code == 201, f"code={code} {r2}")
+
+
+def s14_pause_write_failure():
+    env = PAUSE_ENV
+    _, before = receiver_pause(env)
+    code, r = set_pause(env, False, simulate="write_failure")
+    check("S14 暂停写入失败返回 5xx", code == 500, f"code={code} {r}")
+    _, after = receiver_pause(env)
+    check("S14 写入失败后开关状态不变", after.get("paused") == before.get("paused"), f"{before} vs {after}")
+
+    set_pause(env, True)
+    _, before = receiver_pause(env)
+    code, r = set_pause(env, False, simulate="write_failure")
+    check("S14 恢复写入失败返回 5xx", code == 500, f"code={code} {r}")
+    _, after = receiver_pause(env)
+    check("S14 恢复失败后仍为已暂停", before.get("paused") is True and after.get("paused") is True,
+          f"{before} vs {after}")
+    code, r2 = receiver_post(env, key("p-fail"), "success")
+    check("S14 失败后暂停仍真实生效", code == 423, f"code={code} {r2}")
+    set_pause(env, False)
+
+
+def s15_pause_survives_restart():
+    env = PERSIST_ENV
+    code, st = set_pause(env, True)
+    check("S15 重启前暂停成功", code == 200 and st.get("state", {}).get("paused") is True, f"{st}")
+    hook("RN_HOOK_RESTART_RECEIVER", "docker compose restart receiver")
+    if not wait_up(RECEIVER):
+        check("S15 接收端重启后恢复服务", False)
+        return
+    _, state = receiver_pause(env)
+    check("S15 重启后暂停开关仍保留", state.get("paused") is True, f"{state}")
+    code, r = receiver_post(env, key("persist"), "success")
+    check("S15 重启后新发布号仍被拒收", code == 423, f"code={code} {r}")
+    set_pause(env, False)
+
+
+def s16_sender_rejected_then_recover():
+    env = RECOVER_ENV
+    set_pause(env, False)
+    k = key("rec")
+    code, n = sender_create(env, k, "success")
+    nid = n["id"]
+
+    set_pause(env, True)
+    code, n2 = sender_send(nid)
+    check("S16 发送端显示暂停拒收", n2.get("status") == "REJECTED", f"code={code} {n2}")
+    check("S16 拒收不等于已送达（无回执号）", not n2.get("receipt_id"), f"{n2}")
+
+    code, n3 = sender_reconcile(nid)
+    check("S16 暂停期间核对不误判为可安全重发",
+          n3.get("status") == "REJECTED" and not n3.get("note", "").startswith("接收端无此记录"),
+          f"{n3}")
+    rows = sender_rows(k, env)
+    check("S16 暂停期间发送端状态未被改写", len(rows) == 1 and rows[0]["status"] == "REJECTED", f"{rows}")
+    check("S16 暂停期间接收端确实无记录", len(receiver_rows(k, env)) == 0, f"{receiver_rows(k, env)}")
+
+    code, rp = req("GET", SENDER + "/api/receiver-pauses")
+    check("S16 发送端网页可读到暂停状态", rp.get("reachable") is True and
+          any(p.get("env") == env and p.get("paused") for p in rp.get("items", [])), f"{rp}")
+
+    set_pause(env, False)
+    code, rp2 = req("GET", SENDER + "/api/receiver-pauses")
+    check("S16 恢复后发送端读到未暂停", rp2.get("reachable") is True and
+          not any(p.get("env") == env and p.get("paused") for p in rp2.get("items", [])), f"{rp2}")
+
+    code, n4 = sender_reconcile(nid)
+    check("S16 恢复后核对为接收端无记录、可安全重发",
+          n4.get("status") == "PENDING" and "可安全重发" in (n4.get("note") or ""), f"{n4}")
+    code, n5 = sender_send(nid)
+    check("S16 恢复后重试成功且仅一条",
+          n5.get("status") == "ACKED" and len(receiver_rows(k, env)) == 1, f"{n5} {receiver_rows(k, env)}")
+
+
 def s9_receiver_down():
     k = key("k9")
     hook("RN_HOOK_STOP_RECEIVER", "docker compose stop receiver")
@@ -310,10 +509,15 @@ def main():
     s6_slow_response()
     s7_concurrent_same()
     s8_concurrent_diff()
+    s12_pause_reject_and_query()
+    s13_pause_interleaved()
+    s14_pause_write_failure()
     if lifecycle:
         nid_k9 = s9_receiver_down()
         s10_sender_restart_while_down(nid_k9)
         s11_auto_reconcile_after_restart()
+        s15_pause_survives_restart()
+        s16_sender_rejected_then_recover()
 
     print(f"\n通过 {len(PASSED)} 项，失败 {len(FAILED)} 项")
     if FAILED:

@@ -33,9 +33,13 @@
   .b-UNCERTAIN { background: #fff3cd; color: #8a6d1a; }
   .b-ACKED { background: #d9f2e3; color: #1c7c43; }
   .b-CONFLICT { background: #fdecea; color: #c0392b; }
+  .b-REJECTED { background: #e8e3f7; color: #5b3fa8; }
   .muted { color: #9aa5b1; font-size: 12px; }
   .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; }
   .err-text { color: #c0392b; font-size: 12px; max-width: 220px; word-break: break-all; }
+  #pause-banner { margin-top: 10px; font-size: 13px; padding: 8px 10px; border-radius: 6px; display: none; }
+  #pause-banner.on { display: block; background: #e8e3f7; color: #5b3fa8; }
+  #pause-banner.unknown { display: block; background: #fff3cd; color: #8a6d1a; }
 </style>
 </head>
 <body>
@@ -65,6 +69,19 @@
       <button type="submit">提交并发送</button>
       <div id="msg"></div>
     </form>
+    <div id="pause-banner"></div>
+  </section>
+
+  <section class="card">
+    <h2>入账暂停状态（读取自审计接收端）</h2>
+    <p class="muted" style="margin-top:0">
+      环境被暂停后，新发布号会被明确拒收（状态「暂停拒收」，不视为已送达，也不视为可安全重发）；
+      恢复后请先「核对」再重试。已入账回执在暂停期间仍可查询。
+    </p>
+    <table>
+      <thead><tr><th>环境</th><th>状态</th><th>更新时间 (UTC)</th></tr></thead>
+      <tbody id="pause-rows"></tbody>
+    </table>
   </section>
 
   <section class="card">
@@ -82,10 +99,12 @@
   </section>
 </main>
 <script>
-const STATUS_LABEL = { PENDING: "待发送", UNCERTAIN: "待核", ACKED: "已确认", CONFLICT: "冲突" };
+const STATUS_LABEL = { PENDING: "待发送", UNCERTAIN: "待核", ACKED: "已确认", CONFLICT: "冲突", REJECTED: "暂停拒收" };
 
 async function api(path, opts) {
-  const r = await fetch(path, opts);
+  let r;
+  try { r = await fetch(path, opts); }
+  catch (e) { return { status: 0, data: { reachable: false, detail: "本端网络请求失败" } }; }
   let data = {};
   try { data = await r.json(); } catch (e) {}
   return { status: r.status, data };
@@ -102,7 +121,40 @@ function report(d) {
   if (d.status === "ACKED") showMsg("已确认送达（回执 #" + (d.receipt_id ?? "?") + "）", true);
   else if (d.status === "CONFLICT") showMsg("冲突：" + (d.last_error || "内容不一致"), false);
   else if (d.status === "UNCERTAIN") showMsg("未拿到回执，状态=待核：" + (d.last_error || ""), false);
+  else if (d.status === "REJECTED") showMsg("接收端已暂停入账，本次被明确拒收（未入账）：" + (d.last_error || "") +
+    "。这不等于已送达，也不能当作可安全重发；恢复后请先核对再重试。", false);
   else showMsg((d.note ? d.note + "；" : "") + "当前状态：" + (STATUS_LABEL[d.status] || d.status), true);
+}
+
+async function loadPauses() {
+  const r = await api("/api/receiver-pauses");
+  const tbody = document.getElementById("pause-rows");
+  const banner = document.getElementById("pause-banner");
+  tbody.innerHTML = "";
+  const items = (r.data.items || []).filter(p => p.paused);
+  if (r.status === 0 || !r.data.reachable) {
+    banner.className = "unknown";
+    banner.textContent = "接收端暂停状态暂不可查：" + (r.data.detail || "") +
+      "。此期间发送/核对失败只能视为「未确认」，不能当作已送达或可安全重发。";
+  } else if (items.length) {
+    banner.className = "on";
+    banner.textContent = "以下环境已暂停入账，新发布号将被拒收：" + items.map(p => p.env).join("、");
+  } else {
+    banner.className = "";
+    banner.textContent = "";
+  }
+  if (!items.length) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = "<td colspan='3' class='muted'>" +
+      (r.data.reachable ? "当前没有环境处于暂停状态" : "未知（接收端不可达）") + "</td>";
+    tbody.appendChild(tr);
+    return;
+  }
+  for (const p of items) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = "<td>" + esc(p.env) + "</td><td>已暂停</td><td class='muted'>" + esc(p.updated_at || "") + "</td>";
+    tbody.appendChild(tr);
+  }
 }
 
 async function load() {
@@ -151,12 +203,13 @@ document.getElementById("form").onsubmit = async (e) => {
   load();
 };
 
-document.getElementById("btn-refresh").onclick = load;
+document.getElementById("btn-refresh").onclick = () => { load(); loadPauses(); };
 document.getElementById("btn-reconcile-all").onclick = async () => {
-  await api("/api/reconcile-all", { method: "POST" }); load();
+  await api("/api/reconcile-all", { method: "POST" }); load(); loadPauses();
 };
 load();
-setInterval(load, 5000);
+loadPauses();
+setInterval(() => { load(); loadPauses(); }, 5000);
 </script>
 </body>
 </html>

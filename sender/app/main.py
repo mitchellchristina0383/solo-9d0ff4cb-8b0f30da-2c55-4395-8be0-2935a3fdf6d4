@@ -32,6 +32,7 @@ STATUS_PENDING = "PENDING"        # 待发送：已登记，尚未发送或已�
 STATUS_UNCERTAIN = "UNCERTAIN"    # 待核：已发出但回执缺失/对方不可达，是否送达未知
 STATUS_ACKED = "ACKED"            # 已确认：收到接收端内容一致的回执
 STATUS_CONFLICT = "CONFLICT"      # 冲突：同环境同发布号在接收端已存在不同内容
+STATUS_REJECTED = "REJECTED"      # 暂停拒收：接收端因环境暂停明确拒收，未入账且不得当作可安全重发
 
 VALID_SIMULATE = {"lose_response", "slow"}
 
@@ -145,6 +146,12 @@ def do_send(nid: int, simulate: str | None = None) -> tuple[int, dict]:
         elif resp.status_code == 409:
             detail = resp.json().get("detail", "接收端已存在不同内容")
             set_fields(conn, nid, status=STATUS_CONFLICT, last_error=detail)
+        elif resp.status_code == 423:
+            # 环境已暂停：接收端明确拒收且未入账。不能当作已送达，也不能当作可安全重发；
+            # 须待恢复后先核对、再手动重试。
+            body = resp.json()
+            detail = body.get("detail", "接收端环境已暂停，新发布号拒收")
+            set_fields(conn, nid, status=STATUS_REJECTED, last_error=detail)
         else:
             set_fields(conn, nid, status=STATUS_UNCERTAIN,
                        last_error=f"接收端返回 {resp.status_code}，回执缺失")
@@ -174,8 +181,15 @@ def do_reconcile(nid: int) -> tuple[int, dict]:
             return 200, out
 
         if resp.status_code == 404:
-            # 接收端明确无此记录：未送达，可安全重发
-            if row["status"] == STATUS_UNCERTAIN:
+            # 接收端明确无此记录。但若该环境仍处于暂停，拒收/未入账并不等于「可安全重发」：
+            # 暂停期间保持原状态（待核/暂停拒收），待恢复后再次核对再重试。
+            body = resp.json()
+            if body.get("paused"):
+                set_fields(conn, nid, last_error="环境已暂停：接收端无此记录，暂停期间不判定为可安全重发")
+                out = fetch_dict(conn, nid)
+                out["note"] = "环境已暂停，接收端暂无此记录；恢复后请先核对再重试"
+                return 200, out
+            if row["status"] in (STATUS_UNCERTAIN, STATUS_REJECTED):
                 set_fields(conn, nid, status=STATUS_PENDING, last_error=None)
             out = fetch_dict(conn, nid)
             out["note"] = "接收端无此记录，可安全重发"
@@ -197,12 +211,12 @@ def do_reconcile(nid: int) -> tuple[int, dict]:
 
 
 def reconcile_all_open() -> int:
-    """核对所有未结案（待核/待发送）记录，返回处理条数。"""
+    """核对所有未结案（待核/待发送/暂停拒收）记录，返回处理条数。"""
     conn = connect()
     try:
         rows = conn.execute(
-            "SELECT id FROM notifications WHERE status IN (?, ?)",
-            (STATUS_UNCERTAIN, STATUS_PENDING),
+            "SELECT id FROM notifications WHERE status IN (?, ?, ?)",
+            (STATUS_UNCERTAIN, STATUS_PENDING, STATUS_REJECTED),
         ).fetchall()
     finally:
         conn.close()
@@ -320,6 +334,18 @@ def reconcile_notification(nid: int):
 def reconcile_all_endpoint():
     n = reconcile_all_open()
     return {"reconciled": n}
+
+
+@app.get("/api/receiver-pauses")
+def receiver_pauses():
+    """只读代理接收端的暂停状态，供值班网页提示「暂停拒收」。查询不到时如实返回未知。"""
+    try:
+        resp = httpx.get(f"{RECEIVER_URL}/api/pauses", timeout=HTTP_TIMEOUT)
+    except httpx.HTTPError as exc:
+        return {"reachable": False, "items": [], "detail": f"接收端暂不可达（{exc.__class__.__name__}）"}
+    if resp.status_code != 200:
+        return {"reachable": False, "items": [], "detail": f"接收端返回 {resp.status_code}"}
+    return {"reachable": True, "items": resp.json().get("items", [])}
 
 
 @app.get("/")

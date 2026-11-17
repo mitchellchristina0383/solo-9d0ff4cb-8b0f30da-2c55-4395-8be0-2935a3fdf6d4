@@ -16,6 +16,21 @@
   th { color: #7b8794; font-weight: 600; }
   code { background: #eef1f4; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
   .muted { color: #9aa5b1; font-size: 12px; }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; }
+  label { font-size: 13px; color: #52606d; display: block; margin-bottom: 10px; flex: 1; min-width: 140px; }
+  input[type=text] { width: 100%; padding: 7px 9px; border: 1px solid #cbd2d9; border-radius: 6px; font-size: 14px; margin-top: 3px; }
+  button { background: #0967d2; color: #fff; border: 0; border-radius: 6px; padding: 8px 16px; font-size: 14px; cursor: pointer; }
+  button.warn { background: #b44d12; }
+  button.ok { background: #1c7c43; }
+  button.ghost { background: #e4e7eb; color: #1f2933; }
+  button.small { padding: 4px 10px; font-size: 12px; }
+  #msg { margin-top: 10px; font-size: 13px; padding: 8px 10px; border-radius: 6px; display: none; }
+  #msg.ok { display: block; background: #e3f2e9; color: #1c7c43; }
+  #msg.err { display: block; background: #fdecea; color: #c0392b; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; white-space: nowrap; }
+  .b-on { background: #e8e3f7; color: #5b3fa8; }
+  .b-off { background: #e4e7eb; color: #52606d; }
+  .hint { font-size: 12px; color: #52606d; background: #f5f7fa; border-left: 3px solid #9aa5b1; padding: 7px 10px; margin: 0 0 12px; }
 </style>
 </head>
 <body>
@@ -25,9 +40,34 @@
 </header>
 <main>
   <section class="card">
+    <h2 style="font-size:15px;margin:0 0 12px">按环境暂停 / 恢复入账</h2>
+    <p class="hint">
+      暂停成功后，该环境的新发布号将被明确拒收（423，不落库）；<b>已入账回执在暂停期间仍可查询</b>，
+      同键同内容重试仍返回原回执，异内容仍 409。暂停与在途入账交错时，先提交入库者必拿到可查回执，
+      被拒收的请求不会随后自行入账。开关持久化在 SQLite，重启后保留；写入失败则回滚、原状态不变。
+    </p>
+    <form id="pause-form">
+      <div class="row">
+        <label>环境<input type="text" id="pause-env" placeholder="如 prod" required maxlength="64"></label>
+        <label style="display:flex;align-items:center;gap:6px;min-width:auto">
+          <input type="checkbox" id="pause-fail"> 模拟暂停写入失败（验证原状态不变）
+        </label>
+        <button type="button" class="warn" id="btn-pause" style="margin-bottom:10px">暂停入账</button>
+        <button type="button" class="ok" id="btn-resume" style="margin-bottom:10px">恢复入账</button>
+      </div>
+      <div id="msg"></div>
+    </form>
+    <table>
+      <thead><tr><th>环境</th><th>入账状态</th><th>更新时间 (UTC)</th><th>操作</th></tr></thead>
+      <tbody id="pause-rows"></tbody>
+    </table>
+  </section>
+
+  <section class="card">
     <p class="muted">
       接口：<code>POST /api/receipts</code>（body 可带 <code>"simulate":"lose_response"</code> 模拟入库后丢响应，
-      或 <code>"slow"</code> 模拟慢回执）· <code>GET /api/receipts?env=...&amp;release_no=...</code> 查询回执
+      或 <code>"slow"</code> 模拟慢回执）· <code>GET /api/receipts?env=...&amp;release_no=...</code> 查询回执 ·
+      <code>POST /api/pauses</code> <code>{"env":"prod","paused":true}</code> 暂停/恢复
     </p>
     <table>
       <thead><tr><th>ID</th><th>环境</th><th>发布号</th><th>结果</th><th>入账时间 (UTC)</th></tr></thead>
@@ -37,6 +77,52 @@
 </main>
 <script>
 function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+function showMsg(text, ok) {
+  const el = document.getElementById("msg");
+  el.textContent = text;
+  el.className = ok ? "ok" : "err";
+}
+async function setPause(paused) {
+  const env = document.getElementById("pause-env").value.trim();
+  if (!env) { showMsg("请填写环境", false); return; }
+  const simulate = document.getElementById("pause-fail").checked ? "write_failure" : undefined;
+  const r = await fetch("/api/pauses", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ env, paused, simulate }),
+  });
+  let d = {};
+  try { d = await r.json(); } catch (e) {}
+  if (r.status !== 200) {
+    showMsg((paused ? "暂停" : "恢复") + "失败：" + (d.detail || r.status) +
+      (d.unchanged ? "（当前仍为" + (d.unchanged.paused ? "已暂停" : "未暂停") + "）" : ""), false);
+  } else {
+    showMsg(env + (paused ? " 已暂停入账" : " 已恢复入账"), true);
+  }
+  loadPauses(); load();
+}
+async function loadPauses() {
+  const r = await fetch("/api/pauses");
+  const data = await r.json();
+  const tbody = document.getElementById("pause-rows");
+  tbody.innerHTML = "";
+  if (!(data.items || []).length) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = "<td colspan='4' class='muted'>暂无可操作环境（尚无台账记录）</td>";
+    tbody.appendChild(tr);
+    return;
+  }
+  for (const p of data.items) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = "<td>" + esc(p.env) + "</td>" +
+      '<td><span class="badge ' + (p.paused ? "b-on" : "b-off") + '">' + (p.paused ? "已暂停" : "未暂停") + "</span></td>" +
+      "<td class='muted'>" + esc(p.updated_at || "") + "</td>" +
+      '<td><button class="small ghost" data-act="toggle">' + (p.paused ? "恢复" : "暂停") + "</button></td>";
+    tr.querySelector('[data-act="toggle"]').onclick = () => setPause(!p.paused);
+    tbody.appendChild(tr);
+  }
+}
+document.getElementById("btn-pause").onclick = () => setPause(true);
+document.getElementById("btn-resume").onclick = () => setPause(false);
 async function load() {
   const r = await fetch("/api/receipts");
   const data = await r.json();
@@ -50,7 +136,8 @@ async function load() {
   }
 }
 load();
-setInterval(load, 3000);
+loadPauses();
+setInterval(() => { load(); loadPauses(); }, 3000);
 </script>
 </body>
 </html>

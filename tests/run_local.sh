@@ -27,11 +27,29 @@ start_sender() {
 stop_receiver() { pkill -f "uvicorn app.main:app --host 127.0.0.1 --port 8001" 2>/dev/null || true; }
 stop_sender()   { pkill -f "uvicorn app.main:app --host 127.0.0.1 --port 8000" 2>/dev/null || true; }
 
+wait_port_free() {
+  local port="$1"
+  for _ in $(seq 1 40); do
+    if python3 - "$port" <<'PY'
+import socket, sys
+s = socket.socket()
+s.settimeout(0.2)
+sys.exit(0 if s.connect_ex(("127.0.0.1", int(sys.argv[1]))) != 0 else 1)
+PY
+    then
+      return 0
+    fi
+    sleep 0.25
+  done
+  return 0
+}
+restart_receiver() { stop_receiver; wait_port_free 8001; start_receiver; }
 case "${1:-}" in
   start-all) start_receiver; start_sender ;;
   stop-all) stop_receiver; stop_sender ;;
   stop-receiver) stop_receiver ;;
   start-receiver) start_receiver ;;
+  restart-receiver) restart_receiver ;;
   restart-sender) stop_sender; sleep 1; start_sender ;;
   clean) stop_receiver; stop_sender; rm -rf "$DATA_DIR" ;;
   test)
@@ -41,8 +59,9 @@ case "${1:-}" in
     RN_LIFECYCLE=1 \
     RN_HOOK_STOP_RECEIVER="$ROOT/tests/run_local.sh stop-receiver" \
     RN_HOOK_START_RECEIVER="$ROOT/tests/run_local.sh start-receiver" \
+    RN_HOOK_RESTART_RECEIVER="$ROOT/tests/run_local.sh restart-receiver" \
     RN_HOOK_RESTART_SENDER="$ROOT/tests/run_local.sh restart-sender" \
     python3 "$ROOT/tests/selftest.py" --lifecycle
     ;;
-  *) echo "用法: $0 {start-all|stop-all|stop-receiver|start-receiver|restart-sender|clean|test}"; exit 1 ;;
+  *) echo "用法: $0 {start-all|stop-all|stop-receiver|start-receiver|restart-receiver|restart-sender|clean|test}"; exit 1 ;;
 esac
